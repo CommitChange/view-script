@@ -1,0 +1,6 @@
+- have 'show_if' or 'render_if' not compute any children if predicate is false
+- distinguish def where objects get rest, vs def where objects get merged ('def' vs 'merge'?)
+- distinguish between 'def', which creates bindings, and something like 'builtin', which saves no bindings
+- make the dom scoping of 'this' *only* fully matching variable names
+- make a 'let' function that can define stuff just for the element scope (can replace 'scope', more generalized, or can implement scope with it?)
+- ?? explicit ".render" function, take out rendering on defs. not sure if we can do this as efficiently though

@@ -1,0 +1,591 @@
+var each_node = require('./lib/each_node')
+var copy = require('./lib/copy')
+var iter = require('./lib/iter')
+var parse = require('./lib/parse')
+var deep_get = require('./lib/deep_get')
+var flatten_keys = require('./lib/flatten_keys')
+var unflatten_keys = require('./lib/unflatten_keys')
+var evaluate = require('./lib/evaluate')
+var get_keys = require('./lib/get_keys')
+var prev_elem = require('./lib/prev_elem')
+
+var app = module.exports = { _bindings: {}, _repeat_counter: 0, _scope_name: ''}
+
+app.vs = function(expr, node) { return evaluate(expr, this, node) }
+
+app.def = function() {
+	var self = this, node = arguments[arguments.length-1], obj
+
+	if(arguments[0].constructor === Object)
+		obj = arguments[0]
+	else if(typeof arguments[0] === 'string')
+		obj = unflatten_keys(arguments[0], arguments[1])
+	else return self
+
+	for(var key in obj) {
+		if(obj[key] && obj[key].constructor === Object && self[key] && self[key].constructor === Object) {
+			if(self.hasOwnProperty(key))
+				copy.deep(obj[key], self[key])
+			else // Make a complete copy so we do not affect objects in parents and siblings
+				self[key] = copy.deep(obj[key], copy.deep(self[key]))
+		} else self[key] = obj[key]
+	}
+
+	iter.each(flatten_keys(obj), function(key) {
+		key = self._scope_name + key
+		if(self._bindings[key])
+			iter.each(self._bindings[key], function(n) {
+				var result = evaluate(n.textContent.slice(1), self, n)
+			})
+	})
+	return self
+}
+
+app.def_lazy = function(key, fn) {
+	this.def(key, { _lazy: fn })
+		return this
+}
+
+app.render = function(node, key_aliases) {
+	var self = this
+
+	each_node(node, function(n) {
+		var cont = true
+
+		if(n.nodeType === 8 && n.textContent[0] === '=') { // nodeType 8 == comment
+			if(key_aliases)
+				for(var key in key_aliases)
+					n.textContent = n.textContent.replace(RegExp(key, 'g'), key_aliases[key])
+
+			var keys = get_keys(n.textContent.slice(1))
+
+			iter.each(keys, function(k) {
+				self._bindings[k] = self._bindings[k] || []
+				if(self._bindings[k].indexOf(n) === -1) self._bindings[k].push(n)
+			})
+
+			var result = evaluate(n.textContent.slice(1), self, n)
+			if(result && result.skip) cont = false
+		}
+
+		return cont
+	})
+
+	return self
+}
+
+
+app.clear_bindings = function() {
+	this._bindings = {}
+	return this
+}
+
+
+// Namespace data to 'self' or another alias within the containing element
+app.scope = function(scope_name) {
+	var self = this
+
+	if(arguments.length === 3) {
+		var alias = arguments[1]
+		var node = arguments[2]
+	} else if(arguments.length === 2) {
+		var alias = 'this'
+		var node = arguments[1]
+	}
+
+	if(!node || !node.parentNode) return
+
+	var parent = node.parentNode
+	parent.removeChild(node)
+	var aliases = {}
+	aliases[alias] = scope_name
+	self.render(parent, aliases)
+	return {skip: true}
+}
+
+// Default view helpers
+
+app.def('no_op', function() {})
+app.def('id', function(x) { return x })
+
+app.def('put', function() {
+	var node = arguments[arguments.length-1]
+	if(!node) return
+
+	if(arguments.length <= 1) return
+
+	var exprs = iter.slice(arguments, 0, arguments.length-1),
+		interp = node.nextSibling
+
+	if(!interp || interp.className !== 'deja-put') {
+		interp = document.createElement('span')
+		interp.className = 'deja-put'
+		node.parentNode.insertBefore(interp, node.nextSibling)
+	}
+
+	interp.innerHTML = String(exprs)
+	return exprs
+})
+
+
+// Array funcs
+
+app.def('concat', function(arr1_key, arr2, node) {
+	var arr1 = app.vs(arr1_key, node)
+	this.def(arr1_key, arr1.concat(arr2))
+	return arr1
+})
+
+
+app.def('push', function(val, arr_key, node) {
+	var arr = app.vs(arr_key, node)
+	if(!arr.length) arr = []
+	arr.push(val)
+	this.def(arr_key, arr)
+	return arr
+})
+
+
+app.def('pop', function(arr_key, node) {
+	var arr = app.vs(arr_key, node),
+		val = arr.pop()
+	this.def(arr_key, arr)
+	return val
+})
+
+
+app.def('show_if', function(pred, node) {
+	if(!node) return
+	if(pred)
+		prev_elem(node).style.display = ''
+	else
+		prev_elem(node).style.display = 'none'
+})
+
+
+app.def('hide_if', function(pred, node) {
+	if(!node) return
+	if(pred)
+		prev_elem(node).style.display = 'none'
+	else
+		prev_elem(node).style.display = ''
+})
+
+
+app.def('repeat', function(arr, node) {
+	var self = this, parent = node.parentNode
+	if(!node || !parent || !parent.parentNode) return
+
+	parent.style.display = 'none'
+	parent.removeChild(node) // Re-inserted at the bottom of this fn
+
+	if(parent.parentNode.className.indexOf('deja-repeat') !== -1 || parent.parentNode.children.length === 1) {
+		var wrapper = parent.parentNode
+		wrapper.className += ' deja-repeat'
+		while(wrapper.children.length > 1) wrapper.removeChild(wrapper.lastChild)
+	} else {
+		var wrapper = parent.nextSibling
+		if(!wrapper || wrapper.className !== 'deja-repeat') {
+			wrapper = document.createElement('span')
+			wrapper.className = 'deja-repeat'
+			parent.parentNode.insertBefore(wrapper, parent.nextSibling)
+		}
+		else while(wrapper.firstChild) wrapper.removeChild(wrapper.firstChild)
+	}
+
+	self._repeat_counter++
+	var repeat_key_name = '_repeat' + self._repeat_counter
+	self[repeat_key_name] = arr
+	iter.each(arr, function(x, i) {
+		var cloned = parent.cloneNode(true)
+		cloned.style.display = ''
+		self[repeat_key_name][i]['i'] = i
+		self.render(cloned, {this: repeat_key_name + '.' + i})
+		wrapper.appendChild(cloned)
+	})
+
+	parent.insertBefore(node, parent.firstChild) // Re-insert the repeat line into our first element
+	return {skip: true}
+})
+
+
+app.def('add', function() {
+	return sum(args_without_node(arguments))
+})
+
+app.def('sub', function() {
+	return diff(args_without_node(arguments))
+})
+
+app.def('mul', function() {
+	return prod(args_without_node(arguments))
+})
+
+app.def('divide', function(x,y) { return x/y })
+
+app.def('incr', function(key, node) {
+	var val = Number(app.vs(key, node))
+	if(val === undefined) return
+	this.def(key, ++val)
+	return val
+})
+
+app.def('decr', function(key, node) {
+	var val = Number(app.vs(key, node))
+	if(val === undefined) return
+	this.def(key, --val)
+	return val
+})
+
+app.def('cat', function() {
+	return iter.fold(args_without_node(arguments), '',
+		function(str, term) { return str += term })
+})
+
+
+app.def_lazy('on', function(events) {
+	if(arguments.length <= 2) return
+	var node = arguments[arguments.length-1]
+	if(!node) return
+
+	var self = this,
+		args = arguments,
+		prev_node = prev_elem(node),
+		terms = args_without_node(args).slice(1)
+
+	events = app.vs(events, node)
+	if(!(events instanceof Array)) events = [events]
+
+	iter.each(events, function(ev) {
+		prev_node['on' + ev] = function(e) {
+			e.preventDefault()
+			app._event = e
+			iter.each(terms, function(t) { app.vs(t, node) })
+		}
+	})
+})
+
+
+app.def('add_class', function(class_name, node) {
+	if(!node) return
+	add_class(prev_elem(node), class_name)
+})
+
+app.def('remove_class', function(class_name, node) {
+	if(!node) return
+	remove_class(prev_elem(node), class_name)
+})
+
+app.def('has_class', function(class_name, node) {
+	if(!node) return
+	has_class(prev_elem(node), class_name)
+})
+
+app.def('toggle_class', function(class_name, node) {
+	if(!node) return
+	if(has_class(prev_elem(node), class_name))
+		remove_class(prev_elem(node), class_name)
+	else
+		add_class(prev_elem(node), class_name)
+})
+
+app.def('add_class_if', function(pred, class_name, node) {
+	if(!node) return
+	if(pred)
+		add_class(prev_elem(node), class_name)
+	else
+		remove_class(prev_elem(node), class_name)
+})
+
+app.def('set_attr_if', function(pred, attr_key, attr_val, node) {
+	if(!node) return
+	if(pred)
+		prev_elem(node).setAttribute(attr_key, attr_val)
+	else
+		prev_elem(node).removeAttribute(attr_key, attr_val)
+})
+
+app.def('set_attr', function(key, val, node) {
+	if(!node) return
+	prev_elem(node).setAttribute(key, val)
+})
+
+app.def('get_attr', function(key, val, node) {
+	if(!node) return
+	return prev_elem(node).getAttribute(key, val)
+})
+
+app.def('has_attr', function(key, node) {
+	if(!node) return false
+	return prev_elem(node).hasAttribute(key)
+})
+
+app.def('is_checked', function(node) {
+	return this.prev_elem(node).checked
+})
+
+app.def('get_value', function(node) {
+	if(!node) return
+	return prev_elem(node).value
+})
+
+app.def('set_value', function(val, node) {
+	if(!node) return
+	if(val === undefined || val === null)
+		prev_elem(node).value = ''
+	else
+		prev_elem(node).value = val
+})
+
+app.def('text_content', function(node) {
+	return prev_elem(node).textContent
+})
+
+app.def('inner_html', function() {
+	var node, content
+	if(arguments.length === 1) {
+		node = prev_elem(arguments[0])
+	} else {
+		content = arguments[0]
+		node = prev_elem(arguments[1])
+	}
+	if(content) node.innerHTML = content
+	return node.innerHTML
+})
+
+app.def('form_data', function(node) {
+	if(!node) return
+	return new FormData(node.parentNode)
+})
+
+app.def('empty',  function(arr) {
+	return !arr || !arr.length
+})
+
+app.def('length', function(arr) {
+	return (arr ? arr.length : 0)
+})
+
+app.def('tail', function(arr) {
+	return arr.slice(1)
+})
+
+app.def('init', function(arr) {
+	return arr.slice(0, arr.length-1)
+})
+
+app.def('head', function(arr) {
+	return arr[0]
+})
+
+app.def('reload', function() {
+	window.location.reload()
+})
+
+app.def('redirect', function(url) {
+	window.location.href = url
+})
+
+app.def('stringify', function(obj) {
+	return JSON.stringify(obj)
+})
+
+app.def('log', function() {
+	console.log.apply(console, args_without_node(arguments))
+})
+
+
+app.def('form_object', function(node) {
+	if(!node) return
+	var result = {}
+	each_node(node.parentNode, function(n) {
+		if(n.nodeType === 1 && (n.nodeName ===  'INPUT' || n.nodeName === 'TEXTAREA' || n.nodeName === 'SELECT') && n.hasAttribute('name')) {
+			if(n.getAttribute('type') === 'checkbox' || n.getAttribute('type') === 'radio')
+				var val = n.checked
+			else var val = n.value
+			var name = n.getAttribute('name')
+			var existing = deep_get(name, result)[1]
+			if(existing === undefined)
+				copy.deep(unflatten_keys(name, val), result)
+			else {
+				if(existing instanceof Array)
+					existing.push(val)
+				else
+					copy.deep(unflatten_keys(name, [existing, val]), result)
+			}
+		}
+		return true
+	})
+	return result
+})
+
+
+app.def('toggle', function(key) {
+	if(arguments.length < 3) return
+	var node = arguments[arguments.length-1]
+	var existing = app.vs(key, node)
+
+	if(existing === undefined) {
+		this.def(key, arguments[1])
+		return arguments[1]
+	}
+
+	for(var i = 1, len = arguments.length-1; i < len; ++i) {
+		if(existing === arguments[i]) {
+			var index = (i+1) % len
+			if(index === 0) index = 1
+			this.def(key, arguments[index])
+			return arguments[index]
+		}
+	}
+
+	this.def(key, arguments[1])
+	return arguments[1]
+})
+
+
+app.def('style', function(style_rule, val, node) {
+	if(!node) return
+	prev_elem(node).style[style_rule] = val
+})
+
+
+app.def_lazy('if', function(predicate, then_expr) {
+	var else_expr, node
+
+	if(arguments.length === 4)
+		else_expr = arguments[2], node = arguments[3]
+	else
+		node = arguments[2]
+
+	if(app.vs(predicate, node))
+		return app.vs(then_expr, node)
+	else if(else_expr)
+		return app.vs(else_expr, node)
+})
+
+
+app.def_lazy('delay', function(ms, expr, node) {
+	var self = this
+	delay(app.vs(ms, node), function() {
+		app.vs(expr, node)
+	})
+})
+
+
+app.def('select_option', function(val, node) {
+	if(!node) return
+	var option = prev_elem(node).querySelector("option[value='" + val + "']")
+	if(option) option.setAttribute('selected', 'selected')
+})
+
+
+app.def('not',  function(val) {return !val})
+
+app.def('eq', function() {
+	return compare(function(x, y) { return x == y }, args_without_node(arguments), this)
+})
+
+app.def('<', function() {
+	return compare(function(x, y) { return x < y }, args_without_node(arguments), this)
+})
+
+app.def('>', function() {
+	return compare(function(x, y) { return x > y }, args_without_node(arguments), this)
+})
+
+app.def('<=', function() {
+	return compare(function(x, y) { return x <= y }, args_without_node(arguments), this)
+})
+
+app.def('>=', function() {
+	return compare(function(x, y) { return x >= y }, args_without_node(arguments), this)
+})
+
+
+app.def('all', function() {
+	var args = args_without_node(arguments)
+	for(var i = 0; i < args.length; ++i)
+		if(!args[i]) return false
+
+	return args[args.length-1]
+})
+
+
+app.def('any', function() {
+	var args = args_without_node(arguments)
+	for(var i = 0; i < args.length; ++i)
+		if(args[i]) return args[i]
+
+	return args[args.length-1]
+})
+
+
+app.def('obj_to_url_params', function(obj) {
+	var str = ''
+	for(var key in obj) str += '&' + key + '=' + obj[key]
+	str = str.replace(/^&/, '?')
+	return str
+})
+
+app.def('prev_elem', prev_elem)
+
+app.def('clear_and_select_option', function(val, node) {
+	if(!node) return
+	var options = this.prev_elem(node).querySelectorAll("option")
+	for (i = 0; i < options.length; i++)
+		options[i].removeAttribute('selected')
+	this.select_option(val, node)
+})
+
+app.render(document.body)
+
+
+// Utilities
+
+function args_without_node(args) {
+	return iter.slice(args, 0, args.length-1)
+}
+
+function sum(ns) {
+	return iter.fold(ns, 0, function(sum, n) {return sum+n})
+}
+
+function diff(ns) {
+	return iter.fold(ns, function(diff, n) {return diff-n})
+}
+
+function prod(ns) {
+	return iter.fold(ns, 1, function(prod, n) {return prod*n})
+}
+
+function add_class(node, class_name) {
+	if(!has_class(node, class_name)) node.className += ' ' + class_name
+}
+
+function remove_class(node, class_name) {
+	node.className = node.className.replace(class_name, '')
+}
+
+function has_class(node, class_name) {
+	return node.className.indexOf(class_name) !== -1
+}
+
+// N-ary general purpose comparator func
+function compare(fn, args) {
+	var last = args[0]
+	for(var i = 1; i < args.length; ++i) {
+		if(!fn(last, args[i])) return false
+		last = args[i]
+	} return true
+}
+
+// General purpose function delayer
+var delay = (function() {
+	var timer = 0
+	return function(ms, callback) {
+		clearTimeout(timer)
+		timer = setTimeout(callback, ms)
+	}
+})()
+
